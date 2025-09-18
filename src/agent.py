@@ -1,211 +1,212 @@
 import logging
+import os
 from dataclasses import dataclass, field
-from typing import Annotated, Optional, List
-import asyncio
+from typing import Optional, Dict, List, Annotated
+from pathlib import Path
 from dotenv import load_dotenv
+from livekit.agents import (
+    JobContext, 
+    WorkerOptions, 
+    cli, 
+    Agent,
+    AgentSession,
+    RunContext
+)
+from livekit.agents.llm import function_tool, ChatContext, ChatMessage, LLM
+from livekit.plugins import groq, silero, deepgram, cartesia, sarvam
 from pydantic import Field
 
-from livekit.agents import JobContext, WorkerOptions, cli
-from livekit.agents.llm import function_tool
-from livekit.agents.voice import Agent, AgentSession, RunContext
-from livekit.agents.voice.room_io import RoomInputOptions
-from livekit.plugins import deepgram, cartesia, groq, silero, noise_cancellation
+# Load environment variables  
+load_dotenv(dotenv_path=Path(__file__).parent.parent / '.env.local')
 
-# ----------------------------------------------------
-# Setup
-# ----------------------------------------------------
 logger = logging.getLogger("interview-prep-agent")
 logger.setLevel(logging.INFO)
-load_dotenv(".env.local")
 
 # ----------------------------------------------------
-# User Data Storage (per-call session)
+# User Data Schema
 # ----------------------------------------------------
 @dataclass
-class JobSeekerData:
+class JobSeekerProfile:
     name: Optional[str] = None
     age: Optional[str] = None
-    location: Optional[str] = None
-    job_interest: Optional[str] = None
-    languages: List[str] = field(default_factory=list)
-    skills: List[str] = field(default_factory=list)
-    challenges: List[str] = field(default_factory=list)
-    current_stage: str = "greeting"  # greeting -> info_collection -> concept_explanation -> skill_assessment -> practice_intro -> final_qna -> wrap_up
-    conversation_start_time: Optional[float] = None
-    notes: List[str] = field(default_factory=list)
-    skill_responses: List[str] = field(default_factory=list)
-    practice_intro_done: bool = False
-
-    def is_basic_info_complete(self) -> bool:
-        """Check if basic info collection is complete"""
-        return all([self.name, self.age, self.location, self.job_interest])
+    city: Optional[str] = None
+    state: Optional[str] = None
+    target_job: Optional[str] = None  # delivery agent, plumber, electrician, etc.
+    current_status: Optional[str] = None  # applied, looking, preparing
+    languages: List[str] = field(default_factory=list)  # [English, Kannada, etc.]
+    experience_level: Optional[str] = None  # beginner, some experience, experienced
+    work_schedule: Optional[str] = None
+    main_challenges: List[str] = field(default_factory=list)
     
-    def get_job_specific_skills(self) -> List[str]:
-        """Get relevant skills based on job interest"""
-        job_skills = {
-            "delivery agent": ["punctuality", "customer service", "navigation", "phone handling", "vehicle safety"],
-            "plumber": ["pipe fitting", "leak detection", "tool usage", "customer communication", "emergency handling"],
-            "electrician": ["wiring", "safety protocols", "multimeter usage", "troubleshooting", "electrical codes"],
-            "mechanic": ["engine diagnosis", "tool handling", "problem solving", "customer explanation", "safety practices"],
-            "healthcare worker": ["patient care", "hygiene", "empathy", "following protocols", "emergency response"],
-            "it support": ["computer basics", "troubleshooting", "customer patience", "problem solving", "technical communication"]
-        }
-        if self.job_interest and self.job_interest.lower() in job_skills:
-            return job_skills[self.job_interest.lower()]
-        return ["communication", "punctuality", "problem solving", "teamwork", "reliability"]
+    # Session state
+    current_phase: str = "introduction"  # introduction -> setup -> work_analysis -> teaching -> practice -> feedback
+    concepts_understood: bool = False
+    ready_for_practice: bool = False
+    interview_completed: bool = False
+    
+    # Job-specific knowledge
+    job_skills: Dict[str, List[str]] = field(default_factory=dict)
+    safety_points: List[str] = field(default_factory=list)
+    common_questions: List[str] = field(default_factory=list)
 
-# Type alias for RunContext with our JobSeekerData
-RunContext_T = RunContext[JobSeekerData]
+# Type alias for RunContext with JobSeekerProfile
+RunContext_T = RunContext[JobSeekerProfile]
 
 # ----------------------------------------------------
-# Tool functions to update user data
+# Job-specific knowledge base
+# ----------------------------------------------------
+JOB_KNOWLEDGE = {
+    "delivery_agent": {
+        "skills": ["Time management", "Route optimization", "Customer service", "Package handling"],
+        "safety": ["Traffic rules", "Proper lifting techniques", "Weather precautions", "Vehicle maintenance"],
+        "common_questions": [
+            "How do you handle difficult customers?",
+            "What would you do if a package is damaged?",
+            "How do you manage time during peak hours?",
+            "Describe your experience with navigation apps"
+        ],
+        "daily_tasks": ["Package pickup", "Route planning", "Customer interaction", "Vehicle checks"]
+    },
+    "electrician": {
+        "skills": ["Circuit analysis", "Safety protocols", "Tool usage", "Problem diagnosis"],
+        "safety": ["Electrical safety", "PPE usage", "Circuit isolation", "Emergency procedures"],
+        "common_questions": [
+            "How do you test for live wires?",
+            "What PPE do you use for electrical work?",
+            "How do you troubleshoot a short circuit?",
+            "Explain the importance of earthing"
+        ],
+        "daily_tasks": ["Equipment inspection", "Installation work", "Maintenance", "Safety checks"]
+    },
+    "plumber": {
+        "skills": ["Pipe fitting", "Leak detection", "Tool usage", "Water pressure systems"],
+        "safety": ["Chemical safety", "Tool safety", "Water contamination", "Confined spaces"],
+        "common_questions": [
+            "How do you detect hidden leaks?",
+            "What tools do you use for pipe cutting?",
+            "How do you handle emergency repairs?",
+            "Explain different types of pipe materials"
+        ],
+        "daily_tasks": ["System inspection", "Repair work", "Installation", "Maintenance"]
+    },
+    "mechanic": {
+        "skills": ["Engine diagnosis", "Tool usage", "Safety protocols", "Customer communication"],
+        "safety": ["Workshop safety", "Chemical handling", "Equipment safety", "Fire prevention"],
+        "common_questions": [
+            "How do you diagnose engine problems?",
+            "What safety measures do you follow?",
+            "How do you explain repairs to customers?",
+            "Describe your experience with different vehicle types"
+        ],
+        "daily_tasks": ["Vehicle inspection", "Diagnostic tests", "Repair work", "Maintenance"]
+    },
+    "healthcare_worker": {
+        "skills": ["Patient care", "Hygiene protocols", "Communication", "Emergency response"],
+        "safety": ["Infection control", "Patient safety", "Equipment sterilization", "Emergency procedures"],
+        "common_questions": [
+            "How do you ensure patient comfort?",
+            "What hygiene protocols do you follow?",
+            "How do you handle medical emergencies?",
+            "Describe your experience with patient care"
+        ],
+        "daily_tasks": ["Patient care", "Documentation", "Equipment maintenance", "Team coordination"]
+    }
+}
+
+# ----------------------------------------------------
+# Function Tools for Data Collection
 # ----------------------------------------------------
 @function_tool()
-async def update_name(
-    name: Annotated[str, Field(description="The job seeker's name")],
-    context: RunContext_T,
+async def update_profile_basic(
+    name: Annotated[str, Field(description="Person's name")],
+    age: Annotated[str, Field(description="Person's age")],
+    city: Annotated[str, Field(description="City name")],
+    state: Annotated[str, Field(description="State name")],
+    context: RunContext,
 ) -> str:
-    context.userdata.name = name.strip()
-    return f"Got it, your name is {name}"
+    profile = context.proc.userdata["profile"]
+    profile.name = name
+    profile.age = age
+    profile.city = city
+    profile.state = state
+    profile.current_phase = "setup"
+    return f"Profile updated: {name}, {age} years, from {city}, {state}. Now moving to job information collection."
 
 @function_tool()
-async def update_age(
-    age: Annotated[str, Field(description="The job seeker's age")],
-    context: RunContext_T,
-) -> str:
-    context.userdata.age = age.strip()
-    return f"Your age is {age}"
-
-@function_tool()
-async def update_location(
-    location: Annotated[str, Field(description="City and state where the job seeker lives")],
-    context: RunContext_T,
-) -> str:
-    context.userdata.location = location.strip()
-    return f"You are from {location}"
-
-@function_tool()
-async def update_job_interest(
-    job: Annotated[str, Field(description="The type of job they are looking for (plumber, electrician, delivery agent, mechanic, healthcare worker, IT support, etc)")],
-    context: RunContext_T,
-) -> str:
-    context.userdata.job_interest = job.strip()
-    return f"You are looking for {job} job"
-
-@function_tool()
-async def update_skills(
-    skills: Annotated[List[str], Field(description="Skills the person has mentioned they know")],
-    context: RunContext_T,
-) -> str:
-    context.userdata.skills.extend(skills)
-    skill_str = ", ".join(skills)
-    return f"Got it, you know {skill_str}"
-
-@function_tool()
-async def update_challenges(
-    challenges: Annotated[List[str], Field(description="Challenges or issues the person faces in their job search")],
-    context: RunContext_T,
-) -> str:
-    context.userdata.challenges.extend(challenges)
-    return "I understand the challenges you are facing"
-
-@function_tool()
-async def record_skill_response(
-    response: Annotated[str, Field(description="User's response to a skill-based question")],
-    context: RunContext_T,
-) -> str:
-    context.userdata.skill_responses.append(response)
-    return "I have noted your response"
-
-@function_tool()
-async def move_to_concept_explanation(
-    context: RunContext_T,
-) -> str:
-    """Move to explaining interview concepts"""
-    context.userdata.current_stage = "concept_explanation"
-    return "Moving to explain interview concepts"
-
-@function_tool()
-async def move_to_skill_assessment(
-    context: RunContext_T,
-) -> str:
-    """Move to skill assessment phase"""
-    context.userdata.current_stage = "skill_assessment"
-    return "Starting skill assessment"
-
-@function_tool()
-async def move_to_practice_intro(
-    context: RunContext_T,
-) -> str:
-    """Move to practice introduction phase"""
-    context.userdata.current_stage = "practice_intro"
-    return "Moving to practice introduction"
-
-@function_tool()
-async def move_to_final_qna(
-    context: RunContext_T,
-) -> str:
-    """Move to final Q&A phase"""
-    context.userdata.current_stage = "final_qna"
-    return "Moving to final questions"
-
-@function_tool()
-async def move_to_wrap_up(
-    context: RunContext_T,
-) -> str:
-    """Move to wrap up and final feedback"""
-    context.userdata.current_stage = "wrap_up"
-    return "Moving to final feedback and wrap up"
-
-@function_tool()
-async def mark_practice_intro_done(
-    context: RunContext_T,
-) -> str:
-    """Mark that practice introduction is complete"""
-    context.userdata.practice_intro_done = True
-    return "Practice introduction completed"
-
-@function_tool()
-async def start_conversation_timer(
-    context: RunContext_T,
-) -> str:
-    """Start tracking conversation time"""
-    import time
-    context.userdata.conversation_start_time = time.time()
-    return "Timer started"
-
-@function_tool()
-async def update_languages(
+async def update_job_info(
+    target_job: Annotated[str, Field(description="Target job role like delivery_agent, electrician, plumber, mechanic, healthcare_worker")],
+    current_status: Annotated[str, Field(description="Current application status")],
+    experience_level: Annotated[str, Field(description="Experience level: beginner, some_experience, experienced")],
     languages: Annotated[List[str], Field(description="Languages the person speaks")],
-    context: RunContext_T,
+    context: RunContext,
 ) -> str:
-    context.userdata.languages = languages
-    lang_str = ", ".join(languages)
-    return f"You speak {lang_str}"
+    profile = context.proc.userdata["profile"]
+    profile.target_job = target_job.lower().replace(" ", "_")
+    profile.current_status = current_status
+    profile.experience_level = experience_level
+    profile.languages = languages
+    profile.current_phase = "work_analysis"
+    
+    # Load job-specific knowledge
+    if profile.target_job in JOB_KNOWLEDGE:
+        job_data = JOB_KNOWLEDGE[profile.target_job]
+        profile.job_skills = {profile.target_job: job_data["skills"]}
+        profile.safety_points = job_data["safety"]
+        profile.common_questions = job_data["common_questions"]
+    
+    return f"Job information updated: {target_job}, status: {current_status}. Experience: {experience_level}. Now let's understand your work routine."
 
 @function_tool()
-async def move_to_setup_phase(
-    context: RunContext_T,
+async def update_work_schedule(
+    work_schedule: Annotated[str, Field(description="Description of typical work day/schedule")],
+    main_challenges: Annotated[List[str], Field(description="Main challenges faced at work")],
+    context: RunContext,
 ) -> str:
-    """Move to interview setup explanation phase"""
-    context.userdata.current_stage = "concept_explanation"
-    return "Moving to interview preparation concepts"
+    profile = context.proc.userdata["profile"]
+    profile.work_schedule = work_schedule
+    profile.main_challenges = main_challenges
+    profile.current_phase = "teaching"
+    return f"Work schedule and challenges recorded. Now moving to teaching phase to help {profile.name} with interview skills."
 
 @function_tool()
-async def move_to_practice_phase(
-    context: RunContext_T,
+async def mark_concepts_understood(
+    understood: Annotated[bool, Field(description="Whether user understood the concepts")],
+    context: RunContext,
 ) -> str:
-    """Move to practice phase"""
-    context.userdata.current_stage = "practice_intro"
-    return "Starting interview practice"
+    profile = context.proc.userdata["profile"]
+    profile.concepts_understood = understood
+    if understood:
+        profile.current_phase = "practice"
+        profile.ready_for_practice = True
+    return f"Concepts understanding marked as {understood}. {'Ready for practice interview!' if understood else 'Will continue teaching.'}"
 
 @function_tool()
-async def add_note(
-    note: Annotated[str, Field(description="Add a note about the conversation")],
-    context: RunContext_T,
+async def advance_to_teaching(
+    context: RunContext,
 ) -> str:
-    context.userdata.notes.append(note)
-    return "Note added"
+    profile = context.proc.userdata["profile"]
+    profile.current_phase = "teaching"
+    return f"Advanced to teaching phase. Will now teach {profile.name} about interview skills for {profile.target_job} role."
+
+@function_tool()
+async def start_practice_interview(
+    context: RunContext,
+) -> str:
+    profile = context.proc.userdata["profile"]
+    profile.current_phase = "practice"
+    profile.ready_for_practice = True
+    return f"Starting practice interview session for {profile.name}. Let's begin with introduction practice."
+
+@function_tool()
+async def complete_interview(
+    performance_score: Annotated[str, Field(description="Performance assessment")],
+    feedback_points: Annotated[List[str], Field(description="Key feedback points")],
+    context: RunContext,
+) -> str:
+    profile = context.proc.userdata["profile"]
+    profile.current_phase = "feedback"
+    profile.interview_completed = True
+    return f"Interview completed for {profile.name}. Performance: {performance_score}. Providing detailed feedback now."
 
 # ----------------------------------------------------
 # Main Interview Prep Agent
@@ -213,199 +214,178 @@ async def add_note(
 class InterviewPrepAgent(Agent):
     def __init__(self) -> None:
         super().__init__(
-            instructions=(
-                "You are a friendly interview preparation coach for blue and gray collar workers in India. "
-                "Your goal is to help job seekers understand interviews, build confidence, and become interview-ready. "
-                
-                "PERSONALITY AND TONE: "
-                "- Speak like a supportive mentor who genuinely cares about their success "
-                "- Use simple, clear language that anyone can understand "
-                "- Be patient, encouraging, and reassuring throughout "
-                "- Make them feel comfortable and confident "
-                "- Use Hinglish phrases naturally when appropriate "
-                
-                "CONVERSATION WORKFLOW (IMPORTANT - Follow this sequence): "
-                
-                "1. GREETING PHASE: "
-                "- Warmly welcome them and introduce yourself as their interview coach "
-                "- Explain that you will help them prepare for job interviews and make them interview-ready "
-                "- Make them feel comfortable and start conversation timer "
-                
-                "2. INFO COLLECTION PHASE (Keep this focused): "
-                "- Collect: Name, Age, City/Location "
-                "- What job they are looking for (delivery agent, plumber, electrician, IT support, healthcare worker, mechanic) "
-                "- What languages they speak (English, Hindi, Kannada, etc.) "
-                "- Ask about challenges they face in job searching "
-                "- Ask what skills they already have related to their target job "
-                
-                "3. CONCEPT EXPLANATION PHASE (3-5 minutes): "
-                "- Explain what an interview is in simple terms "
-                "- Explain what a resume is and why it matters "
-                "- Talk about soft skills (punctuality, communication, teamwork) "
-                "- Explain what employers look for in their specific job type "
-                "- Ask if they understand before moving forward "
-                
-                "4. SKILL ASSESSMENT PHASE: "
-                "- Ask them specific situation-based questions related to their target job "
-                "- For plumber: 'What would you do if a customer's pipe is leaking badly?' "
-                "- For electrician: 'How do you stay safe when working with electricity?' "
-                "- For delivery agent: 'What if a customer is angry about late delivery?' "
-                "- For IT support: 'How do you help someone who says their computer is not working?' "
-                "- For healthcare worker: 'How do you make a patient feel comfortable?' "
-                "- Listen to their response and give INSTANT feedback on what was good and what they could improve "
-                
-                "5. PRACTICE INTRODUCTION PHASE: "
-                "- Summarize what you learned about them (skills, background, job interest) "
-                "- Ask them to introduce themselves as if they are in a real interview "
-                "- Listen and judge their response "
-                "- Give feedback on what they missed or could improve "
-                "- Have a small discussion about specific job requirements "
-                
-                "6. FINAL Q&A PHASE: "
-                "- Ask if they want to practice anything specific again "
-                "- Answer any questions they have about interviews or their target job "
-                "- Ask if they need further explanation on any topic "
-                
-                "7. WRAP UP PHASE: "
-                "- Provide final comprehensive feedback covering: "
-                "  * Key interview tips for their specific job "
-                "  * Skills they should highlight to employers "
-                "  * Soft skills they should demonstrate "
-                "  * Areas they need to work on "
-                "- End on an encouraging note "
-                
-                "TARGET: Complete everything in about 10 minutes maximum "
-                
-                "IMPORTANT FORMATTING RULES: "
-                "- NEVER use markdown, asterisks, bold, italics, or any formatting symbols "
-                "- NEVER use numbered lists (1. 2. 3.) or bullet points (- or *) "
-                "- NEVER use headings with # symbols "
-                "- Speak in natural, conversational sentences only "
-                "- Use words like 'first', 'then', 'also', 'another thing' instead of lists "
-                "- Keep responses conversational and natural for text-to-speech "
-                
-                "JOB-SPECIFIC INTERVIEW FOCUS: "
-                "- Delivery Agent: punctuality, customer service, phone handling, navigation, vehicle safety "
-                "- Electrician: safety protocols, basic electrical knowledge, tool familiarity, problem-solving "
-                "- Plumber: problem-solving, customer interaction, tool knowledge, emergency handling, reliability "
-                "- Mechanic: technical skills, diagnostic abilities, customer communication, safety practices "
-                "- Healthcare Worker: patient care, hygiene, empathy, following protocols, compassion "
-                "- IT Support: basic computer knowledge, problem-solving, patience with customers, clear communication "
-                
-                "Remember: These are hardworking people who may not understand interview processes. Be patient and supportive."
-            ),
-            tools=[
-                update_name, update_age, update_location, update_job_interest,
-                update_languages, update_skills, update_challenges, record_skill_response,
-                move_to_concept_explanation, move_to_skill_assessment, move_to_practice_intro,
-                move_to_final_qna, move_to_wrap_up, mark_practice_intro_done,
-                start_conversation_timer, add_note
-            ],
-            llm=groq.LLM(model="llama-3.1-8b-instant", temperature=0.4),
-            tts=cartesia.TTS(voice="95856005-0332-41b0-935f-352e296aa0df"),  # Warm conversational voice
+            instructions=self._get_dynamic_instructions(),
         )
+    
+    def _get_dynamic_instructions(self) -> str:
+        return """You are a friendly and patient interview preparation coach for blue and gray collar workers in India. 
 
-    async def on_enter(self) -> None:
-        """Called when the agent starts"""
-        logger.info("Interview Prep Agent starting")
+Your role is to help job seekers prepare for interviews by:
+1. Making them comfortable and explaining the AI assistant setup
+2. Collecting their basic information (name, age, location, target job)
+3. Understanding their work experience and challenges
+4. Teaching interview skills and job-specific knowledge
+5. Conducting practice interviews with feedback
+
+COMMUNICATION STYLE:
+- Speak in simple, clear Hindi-English mix (Hinglish) based on user's comfort level
+- Use warm, encouraging tone with phrases like "bilkul theek hai", "achha laga sunkar"
+- Avoid technical jargon - use simple words like "kaam" instead of "profession"
+- Be patient and repeat important points
+- Ask one question at a time
+- Give examples from real work situations they can relate to
+
+LANGUAGE ADAPTATION:
+- If user speaks Hindi/Hinglish: Mix Hindi-English naturally
+- If user prefers English: Speak in simple Indian English
+- If user speaks Kannada: Use basic Kannada greetings mixed with Hindi/English
+- Always mirror the user's language preference and comfort level
+- Use familiar terms: "job", "interview", "kaam", "paisa", "ghar", "family"
+
+IMPORTANT: Always speak naturally without formatting. Use conversational language suitable for voice interaction.
+
+PHASE-BASED BEHAVIOR:
+1. INTRODUCTION: "Namaste! Main aapka interview coach hun. Aap mujhse Hindi mein ya English mein baat kar sakte hain."
+2. PROFILE COLLECTION: Ask warmly about name, age, city, what job they want
+3. WORK ANALYSIS: Understand their daily work routine and challenges
+4. TEACHING: Explain interview basics with simple examples
+5. PRACTICE: Conduct friendly mock interview 
+6. FEEDBACK: Give encouraging feedback with improvement tips
+
+Always use function tools to save information and track progress. Be encouraging and build confidence."""
+
+    async def astart(self, ctx: RunContext) -> None:
+        # Get profile from context
+        profile: JobSeekerProfile = ctx.proc.userdata.get("profile", JobSeekerProfile())
         
-        userdata: JobSeekerData = self.session.userdata
+        # Initialize phase context
+        phase_context = self._get_phase_context(profile)
         
-        # Initialize conversation timer if not set
-        if userdata.conversation_start_time is None:
-            import time
-            userdata.conversation_start_time = time.time()
-        
-        # Calculate elapsed time
-        elapsed_time = 0
-        if userdata.conversation_start_time:
-            import time
-            elapsed_time = (time.time() - userdata.conversation_start_time) / 60  # in minutes
-        
-        # Add context about current conversation state
-        context_msg = (
-            f"Current conversation stage: {userdata.current_stage}\n"
-            f"Elapsed time: {elapsed_time:.1f} minutes (target: ~10 minutes total)\n"
-            f"User info collected:\n"
-            f"Name: {userdata.name or 'Not provided'}\n"
-            f"Age: {userdata.age or 'Not provided'}\n"
-            f"Location: {userdata.location or 'Not provided'}\n"
-            f"Job Interest: {userdata.job_interest or 'Not provided'}\n"
-            f"Languages: {', '.join(userdata.languages) if userdata.languages else 'Not provided'}\n"
-            f"Skills mentioned: {', '.join(userdata.skills) if userdata.skills else 'None yet'}\n"
-            f"Challenges: {', '.join(userdata.challenges) if userdata.challenges else 'None mentioned'}\n"
-            f"Skill responses recorded: {len(userdata.skill_responses)}\n"
-            f"Practice intro done: {userdata.practice_intro_done}\n"
-            f"Job-specific skills to assess: {', '.join(userdata.get_job_specific_skills())}\n"
-            f"Notes: {'; '.join(userdata.notes) if userdata.notes else 'None'}\n\n"
-            
-            "STAGE-SPECIFIC GUIDANCE:\n"
-            f"- If greeting stage: Give warm welcome, explain you'll help with interview prep, start timer\n"
-            f"- If info_collection stage: Ask for missing basic info (name, age, location, job interest, languages, skills, challenges)\n"
-            f"- If concept_explanation stage: Explain interviews, resumes, soft skills, job-specific expectations (3-5 min)\n"
-            f"- If skill_assessment stage: Ask situation-based questions for their job, give instant feedback\n"
-            f"- If practice_intro stage: Have them introduce themselves, give feedback, discuss job requirements\n"
-            f"- If final_qna stage: Ask what they want to practice more, answer questions\n"
-            f"- If wrap_up stage: Give comprehensive final feedback and encouragement\n\n"
-            
-            "Move to next stage when current objectives are complete. "
-            "Keep responses natural and conversational without any formatting. "
-            "Be supportive and encouraging throughout."
+        # Add system context to chat
+        await ctx.llm.achat(
+            chat_ctx=ChatContext([
+                ChatMessage(
+                    role="system", 
+                    content=f"Current session context: {phase_context}\n\nUser Profile: Name: {profile.name or 'Not set'}, Job: {profile.target_job or 'Not set'}, Phase: {profile.current_phase}"
+                )
+            ])
         )
         
-        # Update chat context with current state
-        chat_ctx = self.chat_ctx.copy()
-        chat_ctx.add_message(role="system", content=context_msg)
-        await self.update_chat_ctx(chat_ctx)
-
-        # Generate initial response
-        self.session.generate_reply(tool_choice="auto")
+        # Start appropriate conversation based on phase
+        if profile.current_phase == "introduction":
+            # Use session to generate reply instead of chat message for voice
+            ctx.session.generate_reply(
+                "Namaste! Main aapka interview preparation coach hun. Main aapko job interview ke liye taiyar karne me madad karunga. Aap mujhse Hindi mein ya English mein baat kar sakte hain. Pehle main samjhata hun ke yah kaise kaam karta hai - aap ek AI assistant se baat kar rahe hain jo aapko interview practice mein help karega. Aap ready hain?"
+            )
+        
+        logger.info(f"Agent started for user in phase: {profile.current_phase}")
+    
+    def _get_phase_context(self, profile: JobSeekerProfile) -> str:
+        contexts = {
+            "introduction": """Welcome the user warmly in Hindi/English mix. Explain you're an AI coach here to help with job interviews. 
+                Make them comfortable - say things like 'Aap tension mat lo, main help karunga'. 
+                Explain simply that they're talking to a computer that can help them practice for interviews.
+                Ask if they're comfortable with Hindi-English or prefer one language.""",
+                
+            "setup": """Now collect basic information gently:
+                - Name: 'Aapka naam kya hai?'
+                - Age: 'Aap kitne saal ke hain?'  
+                - City/State: 'Aap kahan se hain?'
+                - Target Job: 'Aap kya kaam dhund rahe hain? Delivery, plumber, electrician?'
+                - Languages: 'Aap kya languages bolte hain?'
+                Use update_profile_basic and update_job_info functions.""",
+                
+            "work_analysis": """Understand their work situation:
+                - 'Aapka daily kaam kaisa hota hai?' 
+                - 'Kya problems face karte hain kaam mein?'
+                - 'Kitna experience hai aapko?'
+                Use update_work_schedule function. Be encouraging about their experience.""",
+                
+            "teaching": """Teach them interview basics with simple examples:
+                - How to introduce themselves professionally
+                - Common questions for their job type  
+                - Body language and confidence tips
+                - Job-specific skills they should mention
+                Keep explanations under 2-3 minutes, then ask if they understood using mark_concepts_understood.""",
+                
+            "practice": """Conduct friendly mock interview:
+                - Ask them to introduce themselves as taught
+                - Ask 2-3 job-specific questions from their profile
+                - Be encouraging: 'Bahut achha!', 'Bilkul sahi!'
+                - Give gentle corrections if needed""",
+                
+            "feedback": """Give constructive feedback:
+                - Highlight what they did well first
+                - Give 2-3 specific improvement areas  
+                - End with encouragement and confidence building
+                Use complete_interview function with assessment."""
+        }
+        return contexts.get(profile.current_phase, "Help the user with interview preparation in their preferred language.")
 
 # ----------------------------------------------------
-# Entrypoint function
+# Entry Point
 # ----------------------------------------------------
+def prewarm(proc):
+    # Load VAD model once during prewarm for better performance
+    proc.userdata["vad"] = silero.VAD.load()
+
 async def entrypoint(ctx: JobContext):
-    """Main entry point for the LiveKit agent"""
     logger.info("Starting Interview Prep Agent")
     
-    # Pre-warm VAD for faster voice activity detection
-    vad = silero.VAD.load()
+    # Initialize user profile
+    profile = JobSeekerProfile()
     
-    # Create user data storage for this session
-    userdata = JobSeekerData()
-    
-    # Create the agent session
-    session = AgentSession[JobSeekerData](
-        userdata=userdata,
+    # Create session with optimal settings for Indian users
+    session = AgentSession(
+        llm=groq.LLM(model="llama-3.1-8b-instant", temperature=0.3),
+        # Use Deepgram with general model (better multilingual support)
         stt=deepgram.STT(
-            model="nova-2", 
-            language="en-IN"  # Indian English for better accent recognition
+            model="nova-2-general", 
+            language="en",  # English with multilingual support
+            smart_format=True,
+            interim_results=True
         ),
-        llm=groq.LLM(model="llama-3.1-8b-instant", temperature=0.4),
-        tts=cartesia.TTS(voice="95d51f79-c397-46f9-b49a-23763d3eaa2d", language="en"),  # Warm conversational voice
-        vad=vad,
-        max_tool_steps=3,  # Limit tool calls to prevent long delays
-        preemptive_generation=True,  # Generate responses while user is speaking for smoother flow
-        
-        # Voice activity settings for better user experience
-        min_endpointing_delay=0.8,  # Wait 0.8s of silence before responding
-        max_endpointing_delay=2.0,  # Allow up to 2s for continued speech
-        allow_interruptions=True,   # Users can interrupt the agent
+        # Use Cartesia with warm voice for better user comfort  
+        tts=cartesia.TTS(
+            voice="a0e99841-438c-4a64-b679-ae501e7d6091",  # Warm female voice
+            model="sonic-english",
+            language="en"
+        ),
+        vad=ctx.proc.userdata.get("vad", silero.VAD.load()),
+        preemptive_generation=True,
+        min_endpointing_delay=1.0,  # Slightly longer for Indian speech patterns
+        max_endpointing_delay=3.0,  # Allow for longer pauses in multilingual speech
+        allow_interruptions=True,
     )
-
+    
+    # Initialize user context
+    ctx.proc.userdata["profile"] = profile
+    
+    # Add session event handlers for better interaction
+    @session.on("agent_speech_started")
+    def _on_agent_speech_started():
+        logger.info("Agent started speaking")
+    
+    @session.on("agent_speech_ended")  
+    def _on_agent_speech_ended():
+        logger.info("Agent finished speaking")
+    
+    @session.on("user_speech_started")
+    def _on_user_speech_started():
+        logger.info("User started speaking")
+        
+    @session.on("user_speech_ended")
+    def _on_user_speech_ended():
+        logger.info("User finished speaking")
+    
+    # Create agent instance
+    agent = InterviewPrepAgent()
+    
     # Start the session
     await session.start(
-        agent=InterviewPrepAgent(),
-        room=ctx.room,
-        room_input_options=RoomInputOptions(
-            noise_cancellation=noise_cancellation.BVC(),  # Background noise cancellation
-        ),
+        agent=agent,
+        room=ctx.room
     )
-    
-    logger.info("Interview Prep Agent session started successfully")
 
-# ----------------------------------------------------
-# Main execution
-# ----------------------------------------------------
 if __name__ == "__main__":
-    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint))
+    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint, prewarm_fnc=prewarm))
