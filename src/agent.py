@@ -347,9 +347,8 @@ async def entrypoint(ctx: JobContext):
         ),
         # Use Cartesia with warm voice for better user comfort  
         tts=cartesia.TTS(
-            voice="a0e99841-438c-4a64-b679-ae501e7d6091",  # Warm female voice
-            model="sonic-english",
-            language="en"
+            voice="95d51f79-c397-46f9-b49a-23763d3eaa2d",
+            language="hi"
         ),
         vad=ctx.proc.userdata.get("vad", silero.VAD.load()),
         preemptive_generation=True,
